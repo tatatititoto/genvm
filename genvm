@@ -36,6 +36,8 @@ _LOOP="" ;
 _THIRD_ONLY=false ;
 _INTERACTIVE_SEQUENCE=false ;
 _TMPDIR="/tmp" ;
+DOCKER="" ;
+EXTLINUX=false ;
 SECURE_TMOUT=1 ;
 ARCH="amd64" ;
 KERNEL="linux-image-" ;
@@ -58,6 +60,8 @@ Options
 	-A	: additionals package to install in vm
 	-c	: specify a config file (first in ${_CONFIG_FILE})
 	-D	: debug mode
+	-d	: use a dockerfile (to precise)
+	-e	: use extlinux insted of grub
 	-f	: format of image : raw, qcow2, qcow, vmdk (default : ${FORMAT})
 	-h	: this message
 	-i	: run interactive shell before exiting
@@ -226,6 +230,11 @@ init_env () {
 	: ${_VERSION:=${CMD_VERSION:=${VERSION}}} ;
 	echo "install debian ${_VERSION}" ;
 	: ${_SERVER:=${CMD_SERVER:=${SERVER}}} ;
+	[ -n "${DOCKER}" ] && {
+		[ -f "${DOCKER}" ] && {
+			echo "install system from \"${DOCKER}\"" ;
+		} || die "File \"${DOCKER}\" not found !" ;
+	} 
 	[ ! -z "${CMD_LISTPKG}" ] && {
 		[ -r ${CMD_LISTPKG} ] && {
 			__content=$(sed '{s/[[:blank:]]//g;s/#.*$//g;s,//.*,,g;/^$/d;s/-$//}' ${CMD_LISTPKG}) ;
@@ -408,9 +417,13 @@ umount_dev () {
 }
 
 install_sys () {
-	echo "debootstrap --arch=${_ARCH} --include=grub2,${_KERNEL}${CMD_ADDPKG} --variant=minbase ${_VERSION} ${_MOUNT_POINT} ${_SERVER}" ;
-	debootstrap --arch=${_ARCH} --include=grub2,${_KERNEL}${CMD_ADDPKG} --variant=minbase ${_VERSION} "${_MOUNT_POINT}" ${_SERVER} || {
-		die "ERR > installation failed. Exit." ;
+	[ -z "${DOCKER}" ] &&  {
+		echo "debootstrap --arch=${_ARCH} --include=grub2,${_KERNEL}${CMD_ADDPKG} --variant=minbase ${_VERSION} ${_MOUNT_POINT} ${_SERVER}" ;
+		debootstrap --arch=${_ARCH} --include=grub2,${_KERNEL}${CMD_ADDPKG} --variant=minbase ${_VERSION} "${_MOUNT_POINT}" ${_SERVER} || {
+			die "ERR > installation failed. Exit." ;
+		}
+	} || {
+		tar xpvf "${DOCKER}" -C "${_MOUNT_POINT}" || die "Echec when extracting \"${DOCKER}\" !" ;
 	}
 }
 
@@ -448,6 +461,14 @@ umount_fs_proc () {
 	echo "proc unmounted" ;
 }
 
+install_extlinux () {
+	chroot "${_MOUNT_POINT}" /bin/bash <<__EOF__
+source /etc/profile
+extlinux --install /boot/extlinux
+cat /usr/lib/extlinux/mbr.bin > ${_NBD}
+__EOF__
+}
+
 mapping_grub () {
 	cat > "${_MOUNT_POINT}"/boot/grub/device.map <<EOF
 (hd0) ${_NBD}
@@ -457,14 +478,14 @@ EOF
 
 install_grub () {
 	echo "chroot ${_MOUNT_POINT} /usr/sbin/grub-install --no-floppy --grub-mkdevicemap=/boot/grub/device.map --root-directory=/ ${_NBD}" ;
-	chroot "${_MOUNT_POINT}" /bin/bash <<__EOF__
+	chroot "${_MOUNT_POINT}" <<__EOF__
 source /etc/profile
 /usr/sbin/grub-install --no-floppy --grub-mkdevicemap=/boot/grub/device.map --root-directory=/ ${_NBD}
 __EOF__
 	[ $? -gt 0 ] && {
 		die "ERR > Installation of grub failed. Exit." ;
 	}
-	chroot "${_MOUNT_POINT}" /bin/bash <<__EOF__
+	chroot "${_MOUNT_POINT}" <<__EOF__
 source /etc/profile
 grub-mkconfig | grep -v ^[[:blank:]]loopback.* | grep -v "^[[:blank:]]set\ root=.*" > /boot/grub/grub.cfg
 __EOF__
@@ -495,7 +516,7 @@ EOF
 }
 
 clean_install () {
-	chroot "${_MOUNT_POINT}" /usr/bin/apt-get clean
+	chroot "${_MOUNT_POINT}" apt-get clean
 }
 
 set_machine_name () {
@@ -503,7 +524,7 @@ set_machine_name () {
 }
 
 run_ch () {
-	CH="chroot ${MOUNT_POINT} /bin/bash" ;
+	CH="chroot ${MOUNT_POINT}" ;
 	$CH <<[*_EOF_*]
 source /etc/profile
 $(cat ${1})
@@ -516,7 +537,7 @@ excute_third_part () {
 
 	[ ! -z "${CMD_THIRD}" ] && {
 		MOUNT_POINT="${_MOUNT_POINT}" ;
-		CH="chroot ${MOUNT_POINT} /bin/bash" ;
+		CH="chroot ${MOUNT_POINT}" ;
 
 		[ -d "${CMD_THIRD}" ] && {
 			for _file in $(find "${CMD_THIRD}" \( -type f -o -type l \) \
@@ -581,11 +602,19 @@ step_by_step () {
 	${_THIRD_ONLY} || install_sys ;
 	mount_fs_dev ;
 	mount_fs_proc ;
-	${_THIRD_ONLY} || mapping_grub ;
-	${_THIRD_ONLY} || install_grub ;
-	${_THIRD_ONLY} || set_machine_name ;
-	${_THIRD_ONLY} || set_passwd_to root "${_ROOTPWD}" ;
-	${_THIRD_ONLY} || clean_install ;
+	${_THIRD_ONLY} || {
+		${EXTLINUX} && {
+			install_extlinux ;
+		} || {
+			mapping_grub ;
+			install_grub ;
+		}
+		[ -z "${DOCKER}" ] && {
+			set_machine_name ;
+			set_passwd_to root "${_ROOTPWD}" ;
+			clean_install ;
+		}
+	}
 	excute_third_part ;
 	${_INTERACTIVE_SEQUENCE} && interactive_seq ;
 	cleaning ;
@@ -594,7 +623,7 @@ step_by_step () {
 
 # main part
 # Partitionnement in developpement option -P
-while getopts ":a:hc:vDn:f:k:s:S:p:V:A:t:l:Tio:" opt ; do
+while getopts ":a:hc:vDd:en:f:k:s:S:p:V:A:t:l:Tio:" opt ; do
 	case ${opt} in
 		h)
 			usage 0 ;;
@@ -606,6 +635,10 @@ while getopts ":a:hc:vDn:f:k:s:S:p:V:A:t:l:Tio:" opt ; do
 			_CONFIG_FILE=${OPTARG} ;;
 		D)
 			_DEBUG=true ;;
+		d)
+			DOCKER=${OPTARG} ;;
+		e)
+			EXTLINUX=true ;;
 		f)
 			CMD_FORMAT=${OPTARG} ;;
 		i)
